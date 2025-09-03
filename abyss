@@ -1,0 +1,400 @@
+#!/usr/bin/env python3
+"""
+Abyss - terminal editor for prompt_toolkit v2.0.10
+- Title bar "Abyss"
+- Left gutter (2 columns) to avoid "two chars too far"
+- Split view toggle (Ctrl-N)
+- Ctrl-O Save-as dialog (prefilled), saves and restarts Abyss on the saved file
+- Python auto-indent and simple C-style brace handling
+- Compile / run helpers for C/C++/ASM/Python/Shell/C#/HTML
+- Restores terminal (reset) after exit
+"""
+
+import sys
+import os
+import subprocess
+import re
+import glob
+import socket
+import webbrowser
+from pathlib import Path
+from prompt_toolkit import Application
+from prompt_toolkit.key_binding import KeyBindings
+from prompt_toolkit.layout import Layout, VSplit, HSplit, FloatContainer, Float, Window
+from prompt_toolkit.layout.controls import FormattedTextControl
+from prompt_toolkit.widgets import TextArea, Button, Dialog
+from prompt_toolkit.lexers import PygmentsLexer
+from prompt_toolkit.document import Document
+from prompt_toolkit.application import get_app
+
+# Pygments lexers (best-effort)
+try:
+    from pygments.lexers import (
+        CLexer, CppLexer, PythonLexer, BashLexer, JsonLexer, SqlLexer,
+        NasmLexer, CSharpLexer, HtmlLexer
+    )
+except Exception:
+    from pygments.lexers import CLexer, PythonLexer, BashLexer, JsonLexer, SqlLexer
+    CppLexer = CLexer
+    NasmLexer = CLexer
+    CSharpLexer = CLexer
+    HtmlLexer = CLexer
+
+# Globals
+CURRENT_FILE = None
+SPLIT_VIEW = False
+CURRENT_MODE = "c"
+HTML_SERVER_STARTED = False  # <--- Pour éviter plusieurs serveurs
+
+# --- Text widgets ---
+editor = TextArea(
+    text="",
+    multiline=True,
+    line_numbers=True,
+    wrap_lines=False,
+    lexer=PygmentsLexer(CLexer),
+    scrollbar=True,
+    focus_on_click=True
+)
+
+output = TextArea(
+    text="(Results will appear here)",
+    multiline=True,
+    read_only=True,
+    wrap_lines=True,
+    scrollbar=True
+)
+
+editor_window = Window(content=editor.control, wrap_lines=False)
+output_window = Window(content=output.control, wrap_lines=True)
+
+left_gutter = Window(width=2, char=" ")
+middle_gap = Window(width=2, char=" ")
+
+title_bar = Window(
+    height=1,
+    content=FormattedTextControl([('reverse', ' Abyss ')]),
+    style='reverse'
+)
+
+body_container = VSplit([left_gutter, editor_window], padding=1)
+root_container = FloatContainer(content=HSplit([title_bar, body_container]), floats=[])
+layout_main = Layout(root_container, focused_element=editor_window)
+
+# ---- Helper functions ----
+def save_file(filename: str):
+    global CURRENT_FILE
+    CURRENT_FILE = filename
+    with open(filename, "w", encoding="utf-8") as f:
+        f.write(editor.text)
+    output.text = f"Saved to {filename}"
+
+def open_save_dialog():
+    fname_input = TextArea(multiline=False, height=1, text=CURRENT_FILE or "")
+    kb_dialog = KeyBindings()
+
+    def on_ok():
+        fname = fname_input.text.strip()
+        root_container.floats[:] = []
+        if fname:
+            save_file(fname)
+            get_app().exit(result=fname)
+        else:
+            output.text = "error vanilla 403"
+            layout_main.focus(editor_window)
+
+    ok_button = Button(text="OK", handler=on_ok)
+
+    @kb_dialog.add("enter")
+    def _(event):
+        on_ok()
+
+    fname_input.control.key_bindings = kb_dialog
+
+    dialog = Dialog(
+        title="Save File",
+        body=fname_input,
+        buttons=[ok_button],
+        width=60,
+        modal=True
+    )
+
+    root_container.floats.append(Float(content=dialog))
+    layout_main.focus(fname_input.control)
+
+def read_flags():
+    flags = []
+    try:
+        with open(".vanilla_flags.txt", "r", encoding="utf-8") as f:
+            for line in f:
+                s = line.strip()
+                if s:
+                    flags.append(s)
+    except Exception:
+        pass
+    return flags
+
+def detect_mode(filename: str):
+    global CURRENT_MODE
+    if filename.endswith(".c"):
+        editor.lexer = PygmentsLexer(CLexer); CURRENT_MODE = "c"
+    elif filename.endswith((".cpp", ".cc", ".cxx", ".c++")):
+        editor.lexer = PygmentsLexer(CppLexer); CURRENT_MODE = "cpp"
+    elif filename.endswith(".py"):
+        editor.lexer = PygmentsLexer(PythonLexer); CURRENT_MODE = "py"
+    elif filename.endswith(".sh"):
+        editor.lexer = PygmentsLexer(BashLexer); CURRENT_MODE = "sh"
+    elif filename.endswith(".json"):
+        editor.lexer = PygmentsLexer(JsonLexer); CURRENT_MODE = "json"
+    elif filename.endswith(".sql"):
+        editor.lexer = PygmentsLexer(SqlLexer); CURRENT_MODE = "sql"
+    elif filename.endswith((".s", ".asm")):
+        editor.lexer = PygmentsLexer(NasmLexer); CURRENT_MODE = "asm"
+    elif filename.endswith(".cs"):
+        editor.lexer = PygmentsLexer(CSharpLexer); CURRENT_MODE = "cs"
+    elif filename.endswith(".html"):
+        editor.lexer = PygmentsLexer(HtmlLexer); CURRENT_MODE = "html"
+    else:
+        editor.lexer = PygmentsLexer(CLexer); CURRENT_MODE = "c"
+
+def contains_ncurses(text: str) -> bool:
+    return "#include <ncurses.h>" in text or '#include "ncurses.h"' in text
+
+def is_port_in_use(port=8000):
+    """Vérifie si le port est déjà utilisé"""
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        return s.connect_ex(('localhost', port)) == 0
+
+def compile_and_run_for_extension(ext: str):
+    flags = read_flags()
+    flags_str = " ".join(flags)
+
+    temp_file = "temp" + ext
+    with open(temp_file, "w", encoding="utf-8") as f:
+        f.write(editor.text)
+
+    if ext in (".c", ".cpp", ".s", ".asm", ".py", ".sh", ".cs"):
+        # Gestion standard comme avant
+        if ext in (".c", "c", ""):
+            compile_cmd = f"gcc {temp_file} -o temp {flags_str}".strip()
+            compile_res = subprocess.getoutput(compile_cmd)
+            if compile_res.strip():
+                return False, f"Compilation errors:\n{compile_res}"
+        elif ext in (".cpp", ".cxx", ".cc"):
+            compile_cmd = f"g++ {temp_file} -o temp {flags_str}".strip()
+            compile_res = subprocess.getoutput(compile_cmd)
+            if compile_res.strip():
+                return False, f"Compilation errors:\n{compile_res}"
+        elif ext in (".s", ".asm"):
+            asm_o = "temp.o"
+            nasm_res = subprocess.getoutput(f"nasm -f elf64 {temp_file} -o {asm_o} 2>&1")
+            if nasm_res.strip() != "":
+                compile_cmd = f"gcc {temp_file} -o temp {flags_str} 2>&1"
+                compile_res = subprocess.getoutput(compile_cmd)
+                if compile_res.strip():
+                    return False, f"Compilation errors:\n{compile_res}"
+            else:
+                ld_res = subprocess.getoutput(f"ld {asm_o} -o temp 2>&1")
+                if ld_res.strip():
+                    return False, f"Linker errors:\n{ld_res}"
+        elif ext == ".py":
+            run_out = subprocess.getoutput(f"python3 {temp_file} 2>&1")
+            return False, run_out if run_out.strip() else "(no output)"
+        elif ext == ".sh":
+            os.chmod(temp_file, 0o755)
+            run_out = subprocess.getoutput(f"bash {temp_file} 2>&1")
+            return False, run_out if run_out.strip() else "(no output)"
+        elif ext == ".cs":
+            compile_res = subprocess.getoutput(f"mcs {temp_file} -out:temp.exe 2>&1")
+            if compile_res.strip():
+                return False, f"Compilation errors:\n{compile_res}"
+            run_out = subprocess.getoutput("mono temp.exe 2>&1")
+            return False, run_out if run_out.strip() else "(no output)"
+
+        run_out = subprocess.getoutput("./temp 2>&1")
+        return False, run_out if run_out.strip() else "(no output)"
+
+    if ext in (".json", ".sql"):
+        return False, "(no execution for this file type — syntax highlighting only)"
+
+    if ext == ".html":
+        global HTML_SERVER_STARTED
+        # Supprimer les commentaires
+        clean_text = re.sub(r"<!--.*?-->", "", editor.text, flags=re.DOTALL)
+        temp_file = "temp.html"
+        with open(temp_file, "w", encoding="utf-8") as f:
+            f.write(clean_text)
+
+        # Lancer le serveur une seule fois si le port est libre
+        if not HTML_SERVER_STARTED and not is_port_in_use(8000):
+            subprocess.Popen(["python3", "-m", "http.server", "8000"],
+                             stdout=subprocess.DEVNULL,
+                             stderr=subprocess.DEVNULL)
+            HTML_SERVER_STARTED = True
+
+        html_file = os.path.basename(CURRENT_FILE or temp_file)
+        url = f"http://localhost:8000/{html_file}"
+        webbrowser.open(url)
+        return True, f"Serving {html_file} at {url} (Ctrl+C to stop)"
+
+    return False, "(no output)"
+
+# ---- Key bindings ----
+kb = KeyBindings()
+
+@kb.add("c-x")
+def _(event):
+    root_container.floats[:] = []
+    try:
+        subprocess.call("reset", shell=True)
+    except Exception:
+        pass
+    event.app.exit(result=None)
+
+@kb.add("c-o")
+def _(event):
+    open_save_dialog()
+
+@kb.add("c-k")
+def _(event):
+    buf = event.app.current_buffer
+    doc = buf.document
+    before = len(doc.current_line_before_cursor)
+    after = len(doc.current_line_after_cursor)
+    if doc.cursor_position < len(doc.text):
+        after += 1
+    buf.delete_before_cursor(before)
+    buf.delete(after)
+
+@kb.add("c-n")
+def _(event):
+    global SPLIT_VIEW
+    SPLIT_VIEW = True
+    body_container.children[:] = [left_gutter, editor_window, middle_gap, output_window]
+    layout_main.focus(editor_window)
+
+@kb.add("c-b")
+def _(event):
+    ext = os.path.splitext(CURRENT_FILE or (sys.argv[1] if len(sys.argv) > 1 else ""))[1]
+    # Sauvegarde du fichier courant
+    if CURRENT_FILE:
+        save_file(CURRENT_FILE)
+
+    # HTML spécifique
+    if ext == ".html":
+        temp_file = "temp.html"
+        clean_text = re.sub(r"<!--.*?-->", "", editor.text, flags=re.DOTALL)
+        with open(temp_file, "w", encoding="utf-8") as f:
+            f.write(clean_text)
+
+        # Lancer serveur silencieux si port libre
+        global HTML_SERVER_STARTED
+        if not HTML_SERVER_STARTED and not is_port_in_use(8000):
+            subprocess.Popen(
+                ["python3", "-m", "http.server", "8000"],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL
+            )
+            HTML_SERVER_STARTED = True
+
+        html_file = os.path.basename(CURRENT_FILE)
+        url = f"http://localhost:8000/{html_file}"
+        webbrowser.open(url)
+
+        # Quitter Abyss mais renvoyer le fichier pour le relancer automatiquement
+        event.app.exit(result=CURRENT_FILE)
+        return
+
+    # Pour les autres fichiers
+    handled_in_terminal, message = compile_and_run_for_extension(ext)
+    output.text = message
+    if handled_in_terminal and ext != ".html":
+        event.app.exit()
+        os.system("./temp && clear")
+
+
+# ---- Autopairs ----
+pairs = {"{": "}", "(": ")", "[": "]", "\"": "\"", "'": "'", "<": ">"}
+for opening, closing in pairs.items():
+    @kb.add(opening)
+    def _(event, opening=opening, closing=closing):
+        buf = event.app.current_buffer
+        buf.insert_text(opening + closing)
+        buf.cursor_left()
+
+# ---- Auto-indent & auto-close HTML tags ----
+@kb.add("enter")
+def _(event):
+    buf = event.app.current_buffer
+    doc: Document = buf.document
+    before = doc.text_before_cursor.rstrip()
+
+    # C-style braces
+    if before.endswith("{"):
+        m = re.match(r'(\s*)', doc.current_line_before_cursor)
+        base_indent = m.group(1) if m else ""
+        inner = base_indent + "    "
+        pos0 = buf.cursor_position
+        buf.insert_text("\n" + inner + "\n" + base_indent)
+        buf.cursor_position = pos0 + 1 + len(inner)
+        return
+
+    # Python indent
+    if CURRENT_MODE == "py" and before.endswith(":"):
+        m = re.match(r'(\s*)', doc.current_line_before_cursor)
+        base_indent = m.group(1) if m else ""
+        buf.insert_text("\n" + base_indent + "    ")
+        return
+
+    # ASM labels
+    if CURRENT_MODE == "asm" and before.endswith(":"):
+        m = re.match(r'(\s*)', doc.current_line_before_cursor)
+        base_indent = m.group(1) if m else ""
+        buf.insert_text("\n" + base_indent + "    ")
+        return
+
+    # HTML auto-close tags
+    if CURRENT_MODE == "html":
+        m = re.match(r'(\s*)<([a-zA-Z0-9]+)>$', doc.current_line_before_cursor.strip())
+        if m:
+            base_indent = re.match(r'(\s*)', doc.current_line_before_cursor).group(1) or ""
+            tag = m.group(2)
+            inner_indent = base_indent + "    "
+            pos0 = buf.cursor_position
+            buf.insert_text("\n" + inner_indent + "\n" + base_indent + f"</{tag}>")
+            buf.cursor_position = pos0 + 1 + len(inner_indent)
+            return
+
+    # Comportement par défaut
+    buf.newline()
+
+# ---- Application ----
+app = Application(layout=layout_main, key_bindings=kb, full_screen=True)
+
+# ---- Main runner ----
+if __name__ == "__main__":
+    if len(sys.argv) > 1:
+        arg = sys.argv[1]
+        if arg != "vide" and os.path.exists(arg):
+            CURRENT_FILE = arg
+            with open(arg, "r", encoding="utf-8") as fh:
+                editor.text = fh.read()
+            detect_mode(arg)
+    else:
+        detect_mode("file.c")
+
+    try:
+        result = app.run()
+    finally:
+        try:
+            subprocess.call("reset", shell=True)
+        except Exception:
+            pass
+        for f in glob.glob("temp.*"):
+            try:
+                os.remove(f)
+            except Exception:
+                pass
+
+    if result and isinstance(result, str):
+        os.execv(sys.executable, [sys.executable, sys.argv[0], result])

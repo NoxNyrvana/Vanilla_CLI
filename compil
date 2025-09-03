@@ -1,0 +1,16 @@
+#!/bin/bash
+if [ -z "$1" ]; then
+    echo "error vanilla 23"
+    exit 23
+fi
+
+filename=$(basename -- "$1")
+extension="${filename##*.}"
+name="${filename%.*}"
+
+if [ "$extension" != "c" ]; then
+    echo "error vanilla 201"
+    exit 201
+fi
+
+gcc "$1" -o "$name" || { echo "error vanilla 202"; exit 202; }
