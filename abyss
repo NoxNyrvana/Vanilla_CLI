@@ -1,15 +1,8 @@
 #!/usr/bin/env python3
 """
 Abyss - terminal editor for prompt_toolkit v2.0.10
-- Title bar "Abyss"
-- Left gutter (2 columns) to avoid "two chars too far"
-- Split view toggle (Ctrl-N)
-- Ctrl-O Save-as dialog (prefilled), saves and restarts Abyss on the saved file
-- Python auto-indent and simple C-style brace handling
-- Compile / run helpers for C/C++/ASM/Python/Shell/C#/HTML
-- Restores terminal (reset) after exit
+(…entier comme ton original, avec ajouts pour lancer/stopper GUI/ncurses/term)
 """
-
 import sys
 import os
 import subprocess
@@ -17,6 +10,9 @@ import re
 import glob
 import socket
 import webbrowser
+import shutil
+import signal
+import time
 from pathlib import Path
 from prompt_toolkit import Application
 from prompt_toolkit.key_binding import KeyBindings
@@ -31,7 +27,7 @@ from prompt_toolkit.application import get_app
 try:
     from pygments.lexers import (
         CLexer, CppLexer, PythonLexer, BashLexer, JsonLexer, SqlLexer,
-        NasmLexer, CSharpLexer, HtmlLexer
+        NasmLexer, CSharpLexer, HtmlLexer, JavascriptLexer
     )
 except Exception:
     from pygments.lexers import CLexer, PythonLexer, BashLexer, JsonLexer, SqlLexer
@@ -39,12 +35,18 @@ except Exception:
     NasmLexer = CLexer
     CSharpLexer = CLexer
     HtmlLexer = CLexer
+    JavascriptLexer = CLexer  # petite faute corrigée
 
 # Globals
 CURRENT_FILE = None
 SPLIT_VIEW = False
 CURRENT_MODE = "c"
-HTML_SERVER_STARTED = False  # <--- Pour éviter plusieurs serveurs
+HTML_SERVER_STARTED = False  # éviter plusieurs serveurs
+
+# NEW: processes en cours (clé -> subprocess.Popen)
+RUNNING_PROCS = {}  # ex: RUNNING_PROCS["gui_python"] = Popen(...)
+# Key to identify the "session" we spawn for Ctrl-L toggle
+TOGGLE_KEY = "ctrl_l_process"
 
 # --- Text widgets ---
 editor = TextArea(
@@ -154,6 +156,8 @@ def detect_mode(filename: str):
         editor.lexer = PygmentsLexer(CSharpLexer); CURRENT_MODE = "cs"
     elif filename.endswith(".html"):
         editor.lexer = PygmentsLexer(HtmlLexer); CURRENT_MODE = "html"
+    elif filename.endswith(".js"):
+        editor.lexer = PygmentsLexer(JavascriptLexer); CURRENT_MODE = "js"
     else:
         editor.lexer = PygmentsLexer(CLexer); CURRENT_MODE = "c"
 
@@ -210,6 +214,9 @@ def compile_and_run_for_extension(ext: str):
                 return False, f"Compilation errors:\n{compile_res}"
             run_out = subprocess.getoutput("mono temp.exe 2>&1")
             return False, run_out if run_out.strip() else "(no output)"
+        elif ext == ".js":
+            run_out = subprocess.getoutput(f"node {temp_file} 2>&1")
+            return False, run_out if run_out.strip() else "(no output)"
 
         run_out = subprocess.getoutput("./temp 2>&1")
         return False, run_out if run_out.strip() else "(no output)"
@@ -238,6 +245,81 @@ def compile_and_run_for_extension(ext: str):
         return True, f"Serving {html_file} at {url} (Ctrl+C to stop)"
 
     return False, "(no output)"
+
+# ---- NEW helpers pour lancer/terminer processus externes ----
+def find_terminal_emulator():
+    """Retourne la commande et le format d'appel pour lancer un terminal interactif."""
+    # On essaie dans l'ordre courant : utilitaire / options pratiques
+    candidates = [
+        ("x-terminal-emulator", ["x-terminal-emulator", "-e"]),  # Debian generic
+        ("gnome-terminal", ["gnome-terminal", "--"]),            # GNOME
+        ("konsole", ["konsole", "-e"]),                          # KDE
+        ("xterm", ["xterm", "-e"]),                              # xterm
+        ("alacritty", ["alacritty", "-e"]),                      # alacritty
+        ("kitty", ["kitty", "-e"]),                              # kitty
+        ("urxvt", ["urxvt", "-e"])
+    ]
+    for name, proto in candidates:
+        if shutil.which(name):
+            return proto
+    return None
+
+def start_detached_process(key: str, args: list, use_terminal=False, title=None):
+    """Démarre et garde la Popen dans RUNNING_PROCS[key]. Si déjà existant, le remplace."""
+    # Si déjà lancé -> on le termine proprement avant de relancer.
+    if key in RUNNING_PROCS and RUNNING_PROCS[key] is not None:
+        stop_process(key)
+
+    if use_terminal:
+        term = find_terminal_emulator()
+        if term is None:
+            # Pas d'émulateur : fallback démarrer en arrière-plan (ne convient pas pour ncurses)
+            proc = subprocess.Popen(args, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
+        else:
+            # Construire la commande à placer après -e / -- ...
+            # On veut que le terminal reste ouvert après la fin (optionnel) : on ajoute `; exec $SHELL`
+            cmdstr = " ".join(shlex_quote(a) for a in args)
+            # selon terminal, il faut une forme différente
+            if term[0].endswith("gnome-terminal"):
+                # gnome-terminal -- bash -c "cmd; exec bash"
+                proc = subprocess.Popen([term[0], "--", "bash", "-c", f"{cmdstr}; exec bash"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            elif term[0].endswith("konsole"):
+                proc = subprocess.Popen([term[0], "-e", "bash", "-c", f"{cmdstr}; exec bash"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            else:
+                # xterm / alacritty / kitty acceptent -e "cmd"
+                proc = subprocess.Popen([term[0], term[1], "bash", "-c", f"{cmdstr}; exec bash"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    else:
+        # Processus détaché normal (pour GUI), on ne redirige pas stdout/stderr pour voir erreurs si besoin
+        proc = subprocess.Popen(args, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
+
+    RUNNING_PROCS[key] = proc
+    return proc
+
+def stop_process(key: str, timeout=2.0):
+    """Tente terminate(), attend, puis kill() si nécessaire."""
+    proc = RUNNING_PROCS.get(key)
+    if not proc:
+        return False
+    try:
+        proc.terminate()
+    except Exception:
+        pass
+    # wait with timeout
+    try:
+        proc.wait(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        try:
+            proc.kill()
+        except Exception:
+            pass
+    finally:
+        RUNNING_PROCS.pop(key, None)
+    return True
+
+def shlex_quote(s):
+    # petit remplacement de shlex.quote pour compatibilité sans import lourd
+    import shlex
+    return shlex.quote(s)
 
 # ---- Key bindings ----
 kb = KeyBindings()
@@ -272,6 +354,95 @@ def _(event):
     SPLIT_VIEW = True
     body_container.children[:] = [left_gutter, editor_window, middle_gap, output_window]
     layout_main.focus(editor_window)
+
+# ---- NEW: Ctrl-L toggle pour lancer GUI/ncurses/terminal ----
+@kb.add("c-l")
+def _(event):
+    """
+    Ctrl-L:
+    - Si fichier Python (.py) -> lance le script en detached (GUI PyQt par ex.)
+    - Si fichier C et contient ncurses -> lance l'exécutable dans un terminal séparé
+    - Si fichier .sh -> lance le script dans un terminal séparé (utile pour spinner)
+    - Si déjà lancé -> arrête le processus et affiche message
+    """
+    global CURRENT_FILE
+    if not CURRENT_FILE:
+        output.text = "No current file to run (save first)."
+        return
+
+    ext = os.path.splitext(CURRENT_FILE)[1]
+    key = f"{TOGGLE_KEY}:{CURRENT_FILE}"
+    # If already running -> stop
+    if key in RUNNING_PROCS:
+        stopped = stop_process(key)
+        output.text = f"Stopped process for {CURRENT_FILE}."
+        return
+
+    # Save current file before launching
+    try:
+        save_file(CURRENT_FILE)
+    except Exception as e:
+        output.text = f"Error saving before launch: {e}"
+        return
+
+    # Decide how to launch
+    if ext == ".py":
+        # GUI Python: start python3 file.py detached
+        args = ["python3", CURRENT_FILE]
+        start_detached_process(key, args, use_terminal=False)
+        output.text = f"Launched Python GUI: {CURRENT_FILE} (detached). Appuyez à nouveau sur Ctrl-L pour fermer."
+        return
+
+    if ext == ".sh":
+        # Shell script: launch in a terminal so spinner/ncurses shows
+        args = ["bash", CURRENT_FILE]
+        start_detached_process(key, args, use_terminal=True)
+        output.text = f"Launched shell script in new terminal: {CURRENT_FILE}."
+        return
+
+    # C / ncurses: compile then run in terminal emulator if it uses ncurses
+    if ext in (".c", ".cpp", ".s", ".asm"):
+        # compile into temp_exe (non intrusif)
+        bin_name = "temp_ncurses_exec"
+        if ext == ".c":
+            compile_cmd = f"gcc {CURRENT_FILE} -o {bin_name}"
+        elif ext in (".cpp", ".cxx", ".cc"):
+            compile_cmd = f"g++ {CURRENT_FILE} -o {bin_name}"
+        else:
+            compile_cmd = None
+
+        if compile_cmd:
+            compile_out = subprocess.getoutput(compile_cmd + " 2>&1")
+            if compile_out.strip():
+                output.text = f"Compilation failed:\n{compile_out}"
+                return
+
+            # If source contains ncurses includes -> launch in terminal
+            with open(CURRENT_FILE, "r", encoding="utf-8", errors="ignore") as fh:
+                txt = fh.read()
+            if contains_ncurses(txt):
+                args = [os.path.abspath(f"./{bin_name}")]
+                start_detached_process(key, args, use_terminal=True)
+                output.text = f"Lancé exécutable ncurses dans un terminal: {bin_name}"
+                return
+            else:
+                # Non-ncurses: exécution normale en arrière-plan (mais si interactif, l'utilisateur devrait utiliser terminal)
+                args = [os.path.abspath(f"./{bin_name}")]
+                start_detached_process(key, args, use_terminal=False)
+                output.text = f"Lancé exécutable: {bin_name} (détaché)"
+                return
+
+    # JS, cs, etc. -> comportement par défaut : lancer en detached
+    if ext == ".js":
+        args = ["node", CURRENT_FILE]
+        start_detached_process(key, args, use_terminal=False)
+        output.text = f"Lancé node {CURRENT_FILE} (détaché)."
+        return
+
+    # fallback
+    args = ["bash", "-c", f"python3 {CURRENT_FILE}"]
+    start_detached_process(key, args, use_terminal=True)
+    output.text = f"Lancé (fallback) {CURRENT_FILE} dans un terminal."
 
 @kb.add("c-b")
 def _(event):
